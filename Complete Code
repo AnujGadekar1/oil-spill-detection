@@ -1,0 +1,593 @@
+# AI-Based Early Oil Spill Detection System
+# A comprehensive system for detecting potential oil spills using AIS data and satellite imagery
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+import requests
+import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class AISDataProcessor:
+    """Processes and cleans AIS (Automatic Identification System) data"""
+    
+    def __init__(self):
+        self.scaler = StandardScaler()
+        
+    def generate_sample_ais_data(self, num_vessels=100, days=7):
+        """Generate realistic sample AIS data for demonstration"""
+        np.random.seed(42)
+        
+        # Base coordinates for maritime region (North Sea example)
+        base_lat, base_lon = 56.0, 3.0
+        
+        data = []
+        vessel_types = ['Cargo', 'Tanker', 'Container', 'Bulk Carrier', 'Oil Tanker']
+        
+        for vessel_id in range(1, num_vessels + 1):
+            vessel_type = np.random.choice(vessel_types)
+            
+            # Generate time series for each vessel
+            for hour in range(days * 24):
+                timestamp = datetime.now() - timedelta(hours=days*24 - hour)
+                
+                # Normal vessel behavior
+                if np.random.random() > 0.95:  # 5% chance of anomalous behavior
+                    # Anomalous behavior: sudden speed/course changes
+                    speed = np.random.uniform(0, 25)  # Erratic speed
+                    course = np.random.uniform(0, 360)  # Random course
+                    anomaly_flag = True
+                else:
+                    # Normal behavior
+                    speed = np.random.normal(12, 3)  # Normal cruise speed
+                    speed = max(0, min(speed, 25))
+                    course = np.random.normal(180, 30) % 360  # Relatively stable course
+                    anomaly_flag = False
+                
+                # Position with some drift
+                lat = base_lat + np.random.normal(0, 0.5)
+                lon = base_lon + np.random.normal(0, 0.5)
+                
+                data.append({
+                    'vessel_id': f'V{vessel_id:03d}',
+                    'timestamp': timestamp,
+                    'latitude': lat,
+                    'longitude': lon,
+                    'speed': speed,
+                    'course': course,
+                    'vessel_type': vessel_type,
+                    'true_anomaly': anomaly_flag  # Ground truth for evaluation
+                })
+        
+        return pd.DataFrame(data)
+    
+    def calculate_features(self, df):
+        """Calculate advanced features for anomaly detection"""
+        df = df.sort_values(['vessel_id', 'timestamp'])
+        
+        # Calculate vessel-specific features
+        vessel_features = []
+        
+        for vessel_id in df['vessel_id'].unique():
+            vessel_data = df[df['vessel_id'] == vessel_id].copy()
+            
+            if len(vessel_data) < 2:
+                continue
+                
+            # Speed-related features
+            vessel_data['speed_change'] = vessel_data['speed'].diff().abs()
+            vessel_data['speed_variance'] = vessel_data['speed'].rolling(window=5, min_periods=1).var()
+            
+            # Course-related features
+            vessel_data['course_change'] = vessel_data['course'].diff().abs()
+            vessel_data['course_change'] = vessel_data['course_change'].apply(
+                lambda x: min(x, 360-x) if not np.isnan(x) else 0
+            )
+            
+            # Distance and movement features
+            vessel_data['lat_change'] = vessel_data['latitude'].diff().abs()
+            vessel_data['lon_change'] = vessel_data['longitude'].diff().abs()
+            vessel_data['position_change'] = np.sqrt(
+                vessel_data['lat_change']**2 + vessel_data['lon_change']**2
+            )
+            
+            # Time-based features
+            vessel_data['hour'] = vessel_data['timestamp'].dt.hour
+            vessel_data['day_of_week'] = vessel_data['timestamp'].dt.dayofweek
+            
+            # Behavioral consistency features
+            vessel_data['speed_consistency'] = vessel_data['speed'].rolling(window=6, min_periods=1).std()
+            vessel_data['course_consistency'] = vessel_data['course_change'].rolling(window=6, min_periods=1).mean()
+            
+            vessel_features.append(vessel_data)
+        
+        return pd.concat(vessel_features, ignore_index=True)
+
+class AnomalyDetector:
+    """Detects anomalous vessel behavior using machine learning"""
+    
+    def __init__(self):
+        self.isolation_forest = IsolationForest(
+            contamination=0.1,  # Expected proportion of anomalies
+            random_state=42,
+            n_estimators=100
+        )
+        self.dbscan = DBSCAN(eps=0.5, min_samples=5)
+        self.scaler = StandardScaler()
+        
+    def detect_anomalies(self, df):
+        """Detect anomalies using multiple algorithms"""
+        
+        # Select features for anomaly detection
+        feature_columns = [
+            'speed', 'course', 'speed_change', 'speed_variance',
+            'course_change', 'position_change', 'speed_consistency', 'course_consistency'
+        ]
+        
+        # Handle missing values
+        features_df = df[feature_columns].fillna(0)
+        
+        # Scale features
+        features_scaled = self.scaler.fit_transform(features_df)
+        
+        # Isolation Forest detection
+        anomaly_scores = self.isolation_forest.fit_predict(features_scaled)
+        df['anomaly_isolation'] = anomaly_scores == -1
+        
+        # DBSCAN clustering for spatial anomalies
+        spatial_features = df[['latitude', 'longitude', 'speed']].fillna(0)
+        spatial_scaled = StandardScaler().fit_transform(spatial_features)
+        cluster_labels = self.dbscan.fit_predict(spatial_scaled)
+        df['anomaly_spatial'] = cluster_labels == -1
+        
+        # Combined anomaly score
+        df['anomaly_combined'] = df['anomaly_isolation'] | df['anomaly_spatial']
+        
+        # Calculate risk score (0-1)
+        df['risk_score'] = self.isolation_forest.decision_function(features_scaled)
+        df['risk_score'] = (df['risk_score'] - df['risk_score'].min()) / (df['risk_score'].max() - df['risk_score'].min())
+        df['risk_score'] = 1 - df['risk_score']  # Invert so higher = more risky
+        
+        return df
+
+class SatelliteImageryProcessor:
+    """Simulates satellite imagery validation pipeline"""
+    
+    def __init__(self):
+        self.api_available = False  # Simulate API availability
+        
+    def validate_spill_zone(self, lat, lon, timestamp):
+        """Simulate satellite imagery validation of suspected spill zones"""
+        
+        # In a real implementation, this would:
+        # 1. Query satellite imagery APIs (Sentinel, Landsat, etc.)
+        # 2. Apply computer vision models for oil spill detection
+        # 3. Analyze spectral signatures and visual patterns
+        
+        # Simulated validation logic
+        validation_result = {
+            'location': {'lat': lat, 'lon': lon},
+            'timestamp': timestamp,
+            'satellite_available': np.random.random() > 0.3,  # 70% satellite coverage
+            'spill_detected': False,
+            'confidence': 0.0,
+            'image_quality': 'good'
+        }
+        
+        if validation_result['satellite_available']:
+            # Simulate detection algorithm
+            detection_probability = np.random.random()
+            validation_result['spill_detected'] = detection_probability > 0.7
+            validation_result['confidence'] = detection_probability
+            
+            if validation_result['spill_detected']:
+                validation_result['spill_characteristics'] = {
+                    'estimated_size': np.random.uniform(0.1, 10.0),  # km²
+                    'oil_type': np.random.choice(['crude', 'refined', 'unknown']),
+                    'severity': np.random.choice(['minor', 'moderate', 'major'])
+                }
+        
+        return validation_result
+
+class AlertingSystem:
+    """Handles notifications to environmental agencies and stakeholders"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.alert_history = []
+        
+    def send_alert(self, alert_data):
+        """Send alert notifications via multiple channels"""
+        
+        alert = {
+            'id': f"ALERT_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            'timestamp': datetime.now(),
+            'severity': alert_data['severity'],
+            'location': alert_data['location'],
+            'vessel_info': alert_data['vessel_info'],
+            'detection_confidence': alert_data['confidence'],
+            'satellite_validation': alert_data.get('satellite_validation', {}),
+            'recommended_actions': self._get_recommendations(alert_data['severity'])
+        }
+        
+        # Log alert
+        logger.warning(f"🚨 SPILL ALERT GENERATED: {alert['id']}")
+        logger.warning(f"Location: {alert['location']['lat']:.4f}, {alert['location']['lon']:.4f}")
+        logger.warning(f"Vessel: {alert['vessel_info']['id']} ({alert['vessel_info']['type']})")
+        logger.warning(f"Confidence: {alert['detection_confidence']:.2f}")
+        
+        # Simulate different notification channels
+        self._send_email_alert(alert)
+        self._send_sms_alert(alert)
+        self._update_dashboard(alert)
+        
+        self.alert_history.append(alert)
+        return alert
+    
+    def _send_email_alert(self, alert):
+        """Simulate email notification to environmental agencies"""
+        logger.info(f"📧 Email alert sent to environmental agencies for {alert['id']}")
+        
+    def _send_sms_alert(self, alert):
+        """Simulate SMS notification for high-priority alerts"""
+        if alert['severity'] in ['high', 'critical']:
+            logger.info(f"📱 SMS alert sent to emergency contacts for {alert['id']}")
+    
+    def _update_dashboard(self, alert):
+        """Update real-time monitoring dashboard"""
+        logger.info(f"📊 Dashboard updated with alert {alert['id']}")
+    
+    def _get_recommendations(self, severity):
+        """Get recommended actions based on alert severity"""
+        recommendations = {
+            'low': [
+                'Monitor vessel closely',
+                'Prepare response teams',
+                'Contact vessel operator'
+            ],
+            'medium': [
+                'Deploy monitoring vessels',
+                'Alert coastal authorities',
+                'Prepare containment equipment',
+                'Notify maritime traffic control'
+            ],
+            'high': [
+                'Immediate response team deployment',
+                'Activate emergency protocols',
+                'Deploy containment barriers',
+                'Coordinate with coast guard',
+                'Issue navigation warnings'
+            ],
+            'critical': [
+                'Emergency response activation',
+                'Multi-agency coordination',
+                'Media and public notification',
+                'Large-scale containment operation',
+                'Environmental impact assessment'
+            ]
+        }
+        return recommendations.get(severity, recommendations['medium'])
+
+class OilSpillDetectionSystem:
+    """Main system orchestrating all components"""
+    
+    def __init__(self, config=None):
+        self.config = config or self._default_config()
+        
+        # Initialize components
+        self.ais_processor = AISDataProcessor()
+        self.anomaly_detector = AnomalyDetector()
+        self.satellite_processor = SatelliteImageryProcessor()
+        self.alerting_system = AlertingSystem(self.config)
+        
+        # System state
+        self.active_alerts = {}
+        self.monitoring_active = False
+        
+    def _default_config(self):
+        """Default system configuration"""
+        return {
+            'anomaly_threshold': 0.7,
+            'satellite_validation_required': True,
+            'alert_cooldown_minutes': 30,
+            'monitoring_region': {
+                'lat_min': 55.0, 'lat_max': 57.0,
+                'lon_min': 2.0, 'lon_max': 4.0
+            }
+        }
+    
+    def run_detection_cycle(self, ais_data=None):
+        """Run a complete detection cycle"""
+        
+        logger.info("🔍 Starting oil spill detection cycle...")
+        
+        # Step 1: Get AIS data
+        if ais_data is None:
+            logger.info("📡 Generating sample AIS data...")
+            ais_data = self.ais_processor.generate_sample_ais_data()
+        
+        # Step 2: Process and extract features
+        logger.info("⚙️ Processing AIS data and extracting features...")
+        processed_data = self.ais_processor.calculate_features(ais_data)
+        
+        # Step 3: Detect anomalies
+        logger.info("🤖 Running anomaly detection...")
+        anomaly_results = self.anomaly_detector.detect_anomalies(processed_data)
+        
+        # Step 4: Filter high-risk anomalies
+        high_risk_anomalies = anomaly_results[
+            (anomaly_results['anomaly_combined'] == True) & 
+            (anomaly_results['risk_score'] > self.config['anomaly_threshold'])
+        ]
+        
+        logger.info(f"⚠️ Found {len(high_risk_anomalies)} high-risk anomalies")
+        
+        # Step 5: Process each high-risk detection
+        alerts_generated = []
+        
+        for _, anomaly in high_risk_anomalies.iterrows():
+            alert_data = self._process_anomaly(anomaly)
+            if alert_data:
+                alerts_generated.append(alert_data)
+        
+        # Step 6: Generate summary report
+        detection_summary = self._generate_detection_summary(anomaly_results, alerts_generated)
+        
+        logger.info("✅ Detection cycle completed")
+        return detection_summary
+    
+    def _process_anomaly(self, anomaly_row):
+        """Process individual anomaly detection"""
+        
+        vessel_id = anomaly_row['vessel_id']
+        lat, lon = anomaly_row['latitude'], anomaly_row['longitude']
+        timestamp = anomaly_row['timestamp']
+        risk_score = anomaly_row['risk_score']
+        
+        # Check if we already have an active alert for this vessel
+        alert_key = f"{vessel_id}_{timestamp.date()}"
+        if alert_key in self.active_alerts:
+            return None
+        
+        # Step 1: Satellite validation (if required)
+        satellite_validation = None
+        if self.config['satellite_validation_required']:
+            satellite_validation = self.satellite_processor.validate_spill_zone(lat, lon, timestamp)
+            
+            # If satellite imagery doesn't confirm spill, reduce alert severity
+            if not satellite_validation.get('spill_detected', False):
+                if satellite_validation.get('satellite_available', False):
+                    logger.info(f"📡 Satellite validation negative for vessel {vessel_id}")
+                    return None  # Don't generate alert if satellite clearly shows no spill
+        
+        # Step 2: Determine alert severity
+        severity = self._calculate_alert_severity(risk_score, satellite_validation)
+        
+        # Step 3: Generate alert
+        alert_data = {
+            'severity': severity,
+            'location': {'lat': lat, 'lon': lon},
+            'vessel_info': {
+                'id': vessel_id,
+                'type': anomaly_row.get('vessel_type', 'Unknown')
+            },
+            'confidence': risk_score,
+            'satellite_validation': satellite_validation,
+            'detection_time': timestamp
+        }
+        
+        # Generate alert
+        alert = self.alerting_system.send_alert(alert_data)
+        
+        # Track active alert
+        self.active_alerts[alert_key] = alert
+        
+        return alert
+    
+    def _calculate_alert_severity(self, risk_score, satellite_validation):
+        """Calculate alert severity based on multiple factors"""
+        
+        base_severity = 'low'
+        
+        if risk_score > 0.9:
+            base_severity = 'critical'
+        elif risk_score > 0.8:
+            base_severity = 'high'
+        elif risk_score > 0.7:
+            base_severity = 'medium'
+        
+        # Upgrade severity if satellite confirms spill
+        if satellite_validation and satellite_validation.get('spill_detected', False):
+            if satellite_validation.get('confidence', 0) > 0.8:
+                if base_severity == 'low':
+                    base_severity = 'medium'
+                elif base_severity == 'medium':
+                    base_severity = 'high'
+        
+        return base_severity
+    
+    def _generate_detection_summary(self, anomaly_results, alerts_generated):
+        """Generate comprehensive detection summary"""
+        
+        total_vessels = anomaly_results['vessel_id'].nunique()
+        total_anomalies = anomaly_results['anomaly_combined'].sum()
+        high_risk_count = len(anomaly_results[anomaly_results['risk_score'] > 0.7])
+        alerts_count = len(alerts_generated)
+        
+        # Performance metrics (comparing with ground truth if available)
+        if 'true_anomaly' in anomaly_results.columns:
+            true_positives = ((anomaly_results['anomaly_combined'] == True) & 
+                            (anomaly_results['true_anomaly'] == True)).sum()
+            false_positives = ((anomaly_results['anomaly_combined'] == True) & 
+                             (anomaly_results['true_anomaly'] == False)).sum()
+            true_negatives = ((anomaly_results['anomaly_combined'] == False) & 
+                            (anomaly_results['true_anomaly'] == False)).sum()
+            false_negatives = ((anomaly_results['anomaly_combined'] == False) & 
+                             (anomaly_results['true_anomaly'] == True)).sum()
+            
+            precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+            recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        else:
+            precision = recall = f1_score = None
+        
+        summary = {
+            'timestamp': datetime.now(),
+            'vessels_monitored': total_vessels,
+            'total_anomalies_detected': total_anomalies,
+            'high_risk_detections': high_risk_count,
+            'alerts_generated': alerts_count,
+            'performance_metrics': {
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1_score
+            } if precision is not None else None,
+            'alert_details': alerts_generated
+        }
+        
+        return summary
+    
+    def visualize_results(self, anomaly_results, summary):
+        """Create visualizations of detection results"""
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle('Oil Spill Detection System - Analysis Results', fontsize=16, fontweight='bold')
+        
+        # 1. Vessel positions with anomalies highlighted
+        ax1 = axes[0, 0]
+        normal_vessels = anomaly_results[anomaly_results['anomaly_combined'] == False]
+        anomalous_vessels = anomaly_results[anomaly_results['anomaly_combined'] == True]
+        
+        ax1.scatter(normal_vessels['longitude'], normal_vessels['latitude'], 
+                   c='blue', alpha=0.6, s=20, label='Normal Behavior')
+        ax1.scatter(anomalous_vessels['longitude'], anomalous_vessels['latitude'], 
+                   c='red', alpha=0.8, s=50, label='Anomalous Behavior')
+        ax1.set_xlabel('Longitude')
+        ax1.set_ylabel('Latitude')
+        ax1.set_title('Vessel Positions & Anomaly Detection')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Risk score distribution
+        ax2 = axes[0, 1]
+        ax2.hist(anomaly_results['risk_score'], bins=30, alpha=0.7, color='orange', edgecolor='black')
+        ax2.axvline(x=0.7, color='red', linestyle='--', linewidth=2, label='Alert Threshold')
+        ax2.set_xlabel('Risk Score')
+        ax2.set_ylabel('Frequency')
+        ax2.set_title('Risk Score Distribution')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. Detection summary pie chart
+        ax3 = axes[1, 0]
+        summary_data = [
+            summary['vessels_monitored'] - summary['total_anomalies_detected'],
+            summary['total_anomalies_detected'] - summary['alerts_generated'],
+            summary['alerts_generated']
+        ]
+        labels = ['Normal Vessels', 'Low-Risk Anomalies', 'High-Risk Alerts']
+        colors = ['green', 'yellow', 'red']
+        
+        ax3.pie(summary_data, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        ax3.set_title('Detection Summary')
+        
+        # 4. Performance metrics (if available)
+        ax4 = axes[1, 1]
+        if summary['performance_metrics'] and summary['performance_metrics']['precision'] is not None:
+            metrics = summary['performance_metrics']
+            metric_names = ['Precision', 'Recall', 'F1-Score']
+            metric_values = [metrics['precision'], metrics['recall'], metrics['f1_score']]
+            
+            bars = ax4.bar(metric_names, metric_values, color=['skyblue', 'lightgreen', 'lightcoral'])
+            ax4.set_ylabel('Score')
+            ax4.set_title('Detection Performance Metrics')
+            ax4.set_ylim(0, 1)
+            
+            # Add value labels on bars
+            for bar, value in zip(bars, metric_values):
+                ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                        f'{value:.3f}', ha='center', va='bottom')
+        else:
+            ax4.text(0.5, 0.5, 'Performance metrics\nnot available\n(no ground truth)', 
+                    ha='center', va='center', transform=ax4.transAxes, fontsize=12)
+            ax4.set_title('Detection Performance Metrics')
+        
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return fig
+
+def main():
+    """Main execution function"""
+    
+    print("🛢️ AI-Based Early Oil Spill Detection System")
+    print("=" * 50)
+    
+    # Initialize system
+    system = OilSpillDetectionSystem()
+    
+    # Run detection cycle
+    print("\n🚀 Running detection cycle...")
+    results = system.run_detection_cycle()
+    
+    # Display results
+    print("\n📊 DETECTION SUMMARY")
+    print("-" * 30)
+    print(f"Vessels Monitored: {results['vessels_monitored']}")
+    print(f"Anomalies Detected: {results['total_anomalies_detected']}")
+    print(f"High-Risk Detections: {results['high_risk_detections']}")
+    print(f"Alerts Generated: {results['alerts_generated']}")
+    
+    if results['performance_metrics']:
+        metrics = results['performance_metrics']
+        print(f"\n🎯 PERFORMANCE METRICS")
+        print("-" * 30)
+        print(f"Precision: {metrics['precision']:.3f}")
+        print(f"Recall: {metrics['recall']:.3f}")
+        print(f"F1-Score: {metrics['f1_score']:.3f}")
+    
+    if results['alert_details']:
+        print(f"\n🚨 ACTIVE ALERTS ({len(results['alert_details'])})")
+        print("-" * 30)
+        for i, alert in enumerate(results['alert_details'], 1):
+            print(f"{i}. Alert ID: {alert['id']}")
+            print(f"   Severity: {alert['severity'].upper()}")
+            print(f"   Location: {alert['location']['lat']:.4f}, {alert['location']['lon']:.4f}")
+            print(f"   Vessel: {alert['vessel_info']['id']} ({alert['vessel_info']['type']})")
+            print(f"   Confidence: {alert['detection_confidence']:.3f}")
+            print()
+    
+    print("✅ System execution completed successfully!")
+    
+    return system, results
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Run the main system
+    system, results = main()
+    
+    # Optional: Generate sample data for visualization
+    sample_data = system.ais_processor.generate_sample_ais_data(num_vessels=50, days=3)
+    processed_data = system.ais_processor.calculate_features(sample_data)
+    anomaly_results = system.anomaly_detector.detect_anomalies(processed_data)
+    
+    # Create visualizations
+    print("\n📈 Generating visualizations...")
+    system.visualize_results(anomaly_results, results)
